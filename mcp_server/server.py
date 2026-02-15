@@ -1,13 +1,21 @@
 import os
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context
 from pydantic import Field
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List
 import re
+import asyncio
+from mcp.server.fastmcp.prompts import base
+from system_prompt import SYSTEM_PROMPT
+from openai import OpenAI
+import json
+import inspect
 
 load_dotenv()
 mcp = FastMCP("PersonalDevAssistant", log_level="ERROR")
+openai = OpenAI()
 
 WORKSPACE_ROOT = os.getenv("MCP_WORKSPACE")
 
@@ -21,9 +29,11 @@ BINARY_EXTENSIONS = {
 }
 
 EXCLUDED_DIRS = {
-    "node_modules", ".venv", "venv", "__pycache__", ".git", ".cache"
+    "node_modules", ".venv", "venv", "__pycache__", ".git", ".cache",
     "dist", "build", "target", "out", "coverage", ".idea", ".vscode",
 }
+
+VENV_MARKERS = {"site-packages", "Lib", "Scripts", "bin", "Include"}
 
 MAX_FILE_SIZE = 300_000  # 300 KB
 MAX_FILES_SCANNED = 300
@@ -47,11 +57,14 @@ COMMON_ENTRY_NAMES = {"main", "index", "app", "server"}
     name="read_file",
     description="Read the contents of a text file inside the configured workspace"
 )
-def read_file(
-    path: str = Field(description="Relative path to the file inside the workspace")
+async def read_file(
+    path: str = Field(description="Relative path to the file inside the workspace"),
+    ctx: Context = None
 ) -> str:
     
     file_path = (WORKSPACE_ROOT / path).resolve()
+    await ctx.info(f"Reading file: {path}")
+
     if not str(file_path).startswith(str(WORKSPACE_ROOT)):
         raise ValueError("Access Denied: Path outside workspace")
     
@@ -65,7 +78,9 @@ def read_file(
         raise ValueError(f"Binary file type '{file_path.suffix}' is not supported by read_file")
     
     try:
-        return file_path.read_text(encoding="utf-8", errors="ignore")
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        await ctx.info(f"Read {len(content)} characters from file")
+        return content
     except Exception as e:
         raise ValueError(f"Failed to read file: {e}")
     
@@ -74,14 +89,17 @@ def read_file(
     name="list_directory",
     description="List files and subdirectories inside a directory in the workspace"
 )
-def list_directory(
+async def list_directory(
     path: str = Field(
         default=".",
         description="Relative path of directory inside the workspace (default: workspace root)"
-    )
+    ),
+    ctx: Context = None
 ) -> List[Dict]:
     
     dir = (WORKSPACE_ROOT / path).resolve()
+    await ctx.info(f"Listing directory: {dir}")
+
     if not str(dir).startswith(str(WORKSPACE_ROOT)):
         raise ValueError("Access Denied: Path outside workspace")
 
@@ -104,6 +122,7 @@ def list_directory(
         except Exception:
             continue # skip unreadable paths
     
+    await ctx.info(f"Found {len(res)} items in directory")
     return res
 
 
@@ -111,7 +130,7 @@ def list_directory(
     name="search_code",
     description="Search for a text pattern across all the files in the workspace"
 )
-def search_code(
+async def search_code(
     query: str = Field(description="Text to search for"),
     path: str = Field(
         default=".",
@@ -120,9 +139,14 @@ def search_code(
     max_results: int = Field(
         default=50,
         description="Maximum number of results to return"
-    )
+    ),
+    ctx: Context = None
 ) -> List[Dict]:
+    
+    await ctx.info(f"Searching project for '{query}'")
+
     # normalize query to get meaningful tokens (to support multiline queries)
+    re.sub(r'\(.*\)', '', query) # in functions remove '()' funcname() -> func
     tokens = set(
         t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query)
         if len(t) > 2
@@ -163,6 +187,8 @@ def search_code(
             continue
         
         fs += 1
+        if (fs % 100 == 0):
+            await ctx.info(f"Scanned {fs} files…")
         try:
             with fp.open("r", encoding="utf-8", errors="ignore") as f:
                 for n, line in enumerate(f, start=1):
@@ -178,6 +204,7 @@ def search_code(
         except Exception:
             continue
     
+    await ctx.info(f"Search complete. Found {len(res)} matches.")
     return res
 
 
@@ -185,12 +212,14 @@ def search_code(
     name="project_tree",
     description="Get a tree view of the project structure"
 )
-def project_tree(
+async def project_tree(
     max_depth: int = Field(
         default=4,
         description="Maximum directory depth to include"
-    )
+    ),
+    ctx: Context = None
 ) -> Dict:
+    await ctx.info("Scanning the directory for getting project root..")
     # recursive function which works till max depth is reached
     def walk(dir_path: Path, depth: int):
         if depth > max_depth:
@@ -217,14 +246,21 @@ def project_tree(
     name="find_entry_points",
     description="Identify likely execution entry points"
 )
-def find_entry_points() -> List[Dict]:
+async def find_entry_points(ctx: Context) -> List[Dict]:
 
+    await ctx.info("Scanning project for entry points")
     entry_points = []
     fs = 0
+
     for path in WORKSPACE_ROOT.rglob("*"):
+        parts = set(path.parts)
+        
         if fs >= MAX_FILES_SCANNED:
             break
         
+        if "site-packages" in parts:
+            continue
+
         if any(part in EXCLUDED_DIRS for part in path.parts):
             continue
 
@@ -262,6 +298,7 @@ def find_entry_points() -> List[Dict]:
         if len(entry_points) >= 10:
             break
     
+    await ctx.info(f"Detected {len(entry_points)} possible entry points")
     return entry_points
 
 
@@ -270,7 +307,9 @@ def find_entry_points() -> List[Dict]:
     name="summarize_project",
     description="Return high-level structured information about the project for explanation"
 )
-def summarize_project() -> Dict:
+async def summarize_project(ctx: Context) -> Dict:
+
+    await ctx.info("Collecting top-level structure")
     project_name = WORKSPACE_ROOT.name
     items = []
     for path in WORKSPACE_ROOT.iterdir():
@@ -305,3 +344,96 @@ def summarize_project() -> Dict:
         "entry_points": entry_points,
     }
 
+@mcp.tool(
+    name="query",
+    description="Orchestrate codebase analysis tasks using internal reasoning and available tools"
+)
+async def query(
+    question: str = Field(description="User's question about the project"),
+    ctx: Context = None
+) -> str:
+    await ctx.info("Starting agentic query...")
+
+    tool_schemas = []
+    tools_list = await mcp.list_tools()
+
+    for tool in tools_list:
+        if tool.name == "query":
+            continue  # never expose itself
+
+        tool_schemas.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema,
+            }
+        })
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+    MAX_STEPS = 20
+
+    for step in range(MAX_STEPS):
+        await ctx.info(f"Agent reasoning step {step + 1}")
+
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=tool_schemas,
+            tool_choice="auto",
+        )
+
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            await ctx.info("Agent produced final answer")
+            return msg.content or "No answer generated."
+
+        messages.append(msg)
+
+        for call in msg.tool_calls:
+            tool_name = call.function.name
+            args = json.loads(call.function.arguments)
+
+            await ctx.info(f"Calling tool: {tool_name}({args})")
+
+            try:
+                # use the internal tool registry
+                result = await mcp.call_tool(tool_name, args)
+                if inspect.iscoroutine(result):
+                    result = await result
+            except Exception as e:
+                result = f"Error calling tool '{tool_name}': {str(e)}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(result),
+            })
+    await ctx.info("Agent stopped due to step limit")
+    return "I could not fully answer the question within the allowed reasoning steps."
+
+
+
+@mcp.prompt(
+    name="assistant",
+    description="General-purpose codebase assistant"
+)
+def assistant_prompt(query: str) -> list[base.Message]:
+    return [
+        base.UserMessage(
+            content=SYSTEM_PROMPT
+        ),
+        base.UserMessage(
+            content=query
+        ),
+    ]
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+
+# {"jsonrpc": "2.0", "method": "tools/call", "params": {"_meta": {"progressToken": "abc123"}, "name": "read_file", "arguments": {"path": "app/main.py"}}, "id": 3}
