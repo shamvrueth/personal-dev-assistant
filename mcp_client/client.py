@@ -32,19 +32,33 @@ class MCPClient:
         )
         await self._session.initialize()
 
-    async def ask(self, internal_prompt: str) -> str:
+    async def ask(self, internal_prompt: str, command: str, signals: str | None) -> str:
         if not self._session:
             await self.connect()
 
         result = await self._session.call_tool(
             name="query",
-            arguments={"question": internal_prompt},
+            arguments={"question": internal_prompt, "command": command, "signals": signals},
         )
 
         try:
             return result.content[0].text if result.content else "No response"
         except (IndexError, AttributeError):
             return str(result.content) if result.content else "No response"
+        
+    async def call_tool(self, tool_name: str, arguments: dict) -> str:
+        if not self._session:
+            await self.connect()
+        
+        result = await self._session.call_tool(
+            name=tool_name,
+            arguments=arguments
+        )
+
+        if result.content and len(result.content) > 0:
+            return result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+        
+        return str(result)
     
     async def _log_callback(self, params: LoggingMessageNotificationParams):
         # This receives ctx.info(), ctx.warning(), etc.

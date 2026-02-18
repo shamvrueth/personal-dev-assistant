@@ -12,6 +12,7 @@ from system_prompt import SYSTEM_PROMPT
 from openai import OpenAI
 import json
 import inspect
+from raw_signal import collect_signals
 
 load_dotenv()
 mcp = FastMCP("PersonalDevAssistant", log_level="ERROR")
@@ -31,6 +32,7 @@ BINARY_EXTENSIONS = {
 EXCLUDED_DIRS = {
     "node_modules", ".venv", "venv", "__pycache__", ".git", ".cache",
     "dist", "build", "target", "out", "coverage", ".idea", ".vscode",
+    "site-packages", "Lib", "Scripts", "bin", "Include"
 }
 
 VENV_MARKERS = {"site-packages", "Lib", "Scripts", "bin", "Include"}
@@ -50,7 +52,26 @@ ENTRY_PATTERNS = {
     "javascript": "require.main === module",
 }
 
+ALLOWED_EXTENSIONS = {
+    ".py", ".pyw", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", 
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".c", ".h", ".cpp",
+    ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".fs", ".fsx", ".vb", ".go", ".rs",
+    ".rb", ".php", ".swift", ".m", ".mm", ".r", ".R", ".dart", ".lua", 
+    ".ex", ".exs", ".erl", ".hs"
+}
+
 COMMON_ENTRY_NAMES = {"main", "index", "app", "server"}
+
+COMMAND_TOOL_ALLOWLIST = {
+    "explain-flow": {"read_file", "find_entry_points"},
+    "explain": {"summarize_project", "read_file", "find_entry_points"},
+    "find": {"search_code"},
+    "lint": {"read_file"},
+    "optimize": {"read_file"},
+    "explain-file": {"read_file", "search_code"},
+    "tree": {"list_directory"},
+    "fix": {"read_file"}
+}
 
 
 @mcp.tool(
@@ -136,20 +157,18 @@ async def search_code(
         default=".",
         description="Relative directory to search in (default: workspace root)"
     ),
-    max_results: int = Field(
-        default=50,
-        description="Maximum number of results to return"
-    ),
+    max_results: int = 50,
+    raw: bool = False,
     ctx: Context = None
 ) -> List[Dict]:
     
-    await ctx.info(f"Searching project for '{query}'")
+    # await ctx.info(f"Searching project for '{query}'")
 
     # normalize query to get meaningful tokens (to support multiline queries)
     re.sub(r'\(.*\)', '', query) # in functions remove '()' funcname() -> func
     tokens = set(
         t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query)
-        if len(t) > 2
+        if len(t) >= 1
     )
 
     if not tokens:
@@ -168,7 +187,8 @@ async def search_code(
         if fs >= MAX_FILES_SCANNED:
             break
 
-        if any(part in EXCLUDED_DIRS for part in fp.parts):
+        normalized = str(fp).replace("\\", "/")
+        if any(seg in normalized for seg in EXCLUDED_DIRS):
             continue
 
         if len(res) >= max_results:
@@ -180,6 +200,9 @@ async def search_code(
         if fp.suffix.lower() in BINARY_EXTENSIONS: # skip files which cannot be read normally
             continue
 
+        if fp.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+
         try:
             if fp.stat().st_size > MAX_FILE_SIZE:
                 continue
@@ -187,11 +210,13 @@ async def search_code(
             continue
         
         fs += 1
-        if (fs % 100 == 0):
-            await ctx.info(f"Scanned {fs} files…")
+        # if (fs % 100 == 0):
+            # await ctx.info(f"Scanned {fs} files…")
         try:
             with fp.open("r", encoding="utf-8", errors="ignore") as f:
                 for n, line in enumerate(f, start=1):
+                    if line.strip().startswith("#"): # to not scan commented lines
+                        continue
                     if any(token in line for token in tokens):
                         res.append({
                             "file": str(fp.relative_to(WORKSPACE_ROOT)),
@@ -204,7 +229,7 @@ async def search_code(
         except Exception:
             continue
     
-    await ctx.info(f"Search complete. Found {len(res)} matches.")
+    # await ctx.info(f"Search complete. Found {len(res)} matches.")
     return res
 
 
@@ -254,7 +279,7 @@ async def find_entry_points(ctx: Context) -> List[Dict]:
 
     for path in WORKSPACE_ROOT.rglob("*"):
         parts = set(path.parts)
-        
+
         if fs >= MAX_FILES_SCANNED:
             break
         
@@ -334,15 +359,78 @@ async def summarize_project(ctx: Context) -> Dict:
         if len(extensions) >= 10:
             break
     
-    entry_points = find_entry_points()
+    # entry_points = await find_entry_points()
 
     return {
         "project_name": project_name,
         "top_level_structure": sorted(items),
         "key_files": key_files,
         "file_extensions": sorted(extensions),
-        "entry_points": entry_points,
+        # "entry_points": entry_points,
     }
+
+
+@mcp.tool(
+    name="lint",
+    description="Detect potential bugs and design issues in the codebase"
+)
+async def lint(
+    path: str = Field(default="."),
+):
+    try:
+        async def search_wrapper(query: str, path_override: str = "."):
+            return await search_code(query, path_override)
+        
+        signals = await collect_signals(search_wrapper, path)
+
+        return json.dumps(signals, indent=2)
+    except Exception as e:
+        import traceback
+        return json.dumps({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+
+
+@mcp.tool(
+    name="optimize",
+    description="Collect optimization related signals from codebase"
+)
+async def optimize(
+    path: str = Field(default="."),
+):
+    async def search_wrapper(query: str, path_override: str = "."):
+        return await search_code(query=query, path=path_override)
+    
+    signals = await collect_signals(search_wrapper, path)
+
+    optimize_signals = {
+        "expensive_ops": signals.get("expensive_ops", []),
+        "external_calls": signals.get("external_calls", []),
+        "definitions": signals.get("definitions", {}),
+        "usages": signals.get("usages", {}),
+    }
+    return optimize_signals
+
+
+@mcp.tool(
+    name="fix",
+    description="Collect correctness-related signals for bug fixing"
+)
+async def fix(
+    path: str = Field(default="."),
+):
+    async def search_wrapper(query: str, path_override: str = "."):
+        return await search_code(query=query, path=path_override)
+
+    signals = await collect_signals(search_wrapper, path)
+
+    return {
+        "unused": signals.get("unused", []),
+        "external_calls": signals.get("external_calls", []),
+        "try_blocks": signals.get("try_blocks", []),
+    }
+
 
 @mcp.tool(
     name="query",
@@ -350,30 +438,49 @@ async def summarize_project(ctx: Context) -> Dict:
 )
 async def query(
     question: str = Field(description="User's question about the project"),
+    command: str = Field(description="The requested command"),
+    signals: dict | None = Field(
+        default=None,
+        description="Optional precomputed analysis signals (used by lint)"
+    ),
     ctx: Context = None
 ) -> str:
     await ctx.info("Starting agentic query...")
 
     tool_schemas = []
     tools_list = await mcp.list_tools()
+    allowed = COMMAND_TOOL_ALLOWLIST.get(command, set())
 
     for tool in tools_list:
         if tool.name == "query":
             continue  # never expose itself
-
-        tool_schemas.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema,
-            }
-        })
+            
+        if tool.name in allowed:
+            tool_schemas.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.inputSchema,
+                }
+            })
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
     ]
+
+    if signals is not None:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Precomputed analysis signals are provided below. "
+                "You MUST base your reasoning only on these signals. "
+                "Do NOT attempt to rescan the codebase.\n\n"
+                f"{json.dumps(signals, indent=2)}"
+            )
+        })
+
+    messages.append({"role": "user", "content": question})
 
     MAX_STEPS = 20
 
@@ -385,6 +492,7 @@ async def query(
             messages=messages,
             tools=tool_schemas,
             tool_choice="auto",
+            temperature=0.2
         )
 
         msg = response.choices[0].message
