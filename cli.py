@@ -1,8 +1,9 @@
 import argparse
 import sys
 import asyncio
-from mcp_client.client import MCPClient
+from mcp_client.client import MCPClient, MCPHTTPClient
 import json
+from config import get_git_context
 
 def build_prompt(args) -> str:
     if args.command == "explain":
@@ -12,6 +13,11 @@ def build_prompt(args) -> str:
 
             Goal:
             Provide a concise, high-level explanation of the project.
+
+            How to work:
+            - Use summarize_project to get project overview
+            - Use search_relevant_code to understand key components
+            - Use find_entry_points to identify startup logic
 
             Rules:
             - Plain text only
@@ -47,6 +53,10 @@ def build_prompt(args) -> str:
             Goal:
             List execution entry points and explain why each is an entry point.
 
+            How to work:
+            - Use find_entry_points tool
+            - Verify with read_file if needed
+
             Rules:
             - Plain text only
             - No markdown
@@ -58,32 +68,56 @@ def build_prompt(args) -> str:
         )
 
     if args.command == "find":
+        symbol_query = ' '.join(args.symbol)
         return (
-            "You are executing the CLI command: find.\n"
-            f"Goal: Find where '{args.symbol}' is defined and used.\n"
-            "Explain its role in the project.\n"
-            """Rules:
+            f"""
+            You are executing the CLI command: find.
+
+            Goal:
+            Find where '{symbol_query}' is defined and used.
+            Explain its role in the project.
+
+            How to work:
+            - First, use search_code(query="{symbol_query}") for exact matches
+            - Then, use search_relevant_code(query="{symbol_query}") for semantic matches
+            - Combine results from both searches
+            - Use read_file to get full context if needed
+
+            Rules:
             - Plain text only
             - No markdown
             - Group results by file
-            - Show line numbers when available\n
-            """
-            """Format:
+            - Show line numbers when available
+            - Filter out irrelevant results (build artifacts, config files)
+
+            Format:
             FILE: <path>
             - line <n>: <snippet>
+            
+            Explain the role of '{symbol_query}' in the project.
             """
         )
 
     if args.command == "explain-file":
         return (
-            "You are executing the CLI command: explain-file.\n"
-            f"Goal: Explain the file '{args.path}'.\n"
-            "Include its responsibilities and how it fits into the project.\n"
-            """
+            f"""
+            You are executing the CLI command: explain-file.
+
+            Goal:
+            Explain the file '{args.path}'.
+            Include its responsibilities and how it fits into the project.
+
+            How to work:
+            - FIRST: Use read_file to read '{args.path}' (MANDATORY)
+            - If file doesn't exist, respond: "ERROR: File not found: {args.path}"
+            - Use search_relevant_code to find related code if needed
+            - Use summarize_project for project context if needed
+
             Rules:
             - Plain text only
             - No markdown
-            - Base explanation only on the file content and project context
+            - Base explanation ONLY on actual file content
+            - Never hallucinate or guess content
 
             Format:
             FILE
@@ -100,41 +134,56 @@ def build_prompt(args) -> str:
     
     if args.command == "tree":
         return (
-            "You are executing the CLI command: tree.\n\n"
-            "Goal:\n"
-            f"Display the project directory structure until depth = {args.depth}.\n\n"
-            "Rules:\n"
-            "- Plain text only\n"
-            "- Indent with two spaces per level\n"
-            "- Do not explain files\n"
-            "- Respect the specified depth\n"
+            f"""
+            You are executing the CLI command: tree.
+
+            Goal:
+            Display the project directory structure until depth = {args.depth}.
+
+            How to work:
+            - Use list_directory tool with depth parameter
+
+            Rules:
+            - Plain text only
+            - Indent with two spaces per level
+            - Do not explain files
+            - Respect the specified depth
+            """
         )
     
     if args.command == "explain-flow":
         return (
-            f"""You are executing the CLI command: explain-flow.
+            f"""
+            You are executing the CLI command: explain-flow.
 
-                Goal:
-                Explain the execution flow of the file '{args.path}'.
+            Goal:
+            Explain the execution flow of the file '{args.path}'.
 
-                Rules:
-                - Plain text only
-                - No markdown
-                - Explain in logical steps
-                - Do not speculate beyond file contents
+            How to work:
+            - FIRST: Use read_file to read '{args.path}' (MANDATORY)
+            - If file doesn't exist, respond: "ERROR: File not found: {args.path}"
+            - Use search_relevant_code to find related flow if needed
+            - Trace function calls and dependencies
 
-                Format:
+            Rules:
+            - Plain text only
+            - No markdown
+            - Explain in logical steps
+            - Only analyze the specified file
+            - Never hallucinate file contents
 
-                FILE
-                <path>
+            Format:
 
-                FLOW
-                1. ...
-                2. ...
+            FILE
+            <path>
 
-                ROLE
-                <what this file does in the project>
-                """
+            FLOW
+            1. ...
+            2. ...
+
+            ROLE
+            <what this file does in the project>
+            """
         )
     
     if args.command == "lint":
@@ -144,42 +193,43 @@ def build_prompt(args) -> str:
 
             Goal:
             Identify real bugs, fragile logic, and correctness issues in the codebase.
+            Target directory: '{args.path}' (if '.' then analyze entire codebase)
 
             How to work:
-            - You are provided with a signal summary and symbol-level hints
-            - Use signals ONLY to decide which files matter
-            - You MUST read relevant files using read_file before making claims
-            - Do NOT rely on signal text alone
-            - If you do not read a file, you must not mention it
+            1. Make MULTIPLE search_relevant_code calls (at least 5-6 searches):
+               - search_relevant_code("error handling try catch exception blocks", max_results=20)
+               - search_relevant_code("database connections queries SQL transactions", max_results=20)
+               - search_relevant_code("file operations open read write close cleanup", max_results=20)
+               - search_relevant_code("resource management memory leaks connections", max_results=20)
+               - search_relevant_code("async await promises concurrent operations", max_results=20)
+               - search_relevant_code("security vulnerabilities injection validation", max_results=20)
+            
+            2. Examine ALL results with similarity > 0.3
+            
+            3. Read relevant files using read_file for full context
+            
+            4. Analyze actual code for real issues
+            
+            5. Report 5-8 issues if found
 
             Rules:
             - Plain text only
             - No markdown
-            - No stylistic or formatting nitpicks
-            - No speculative issues
-            - Every issue must cite:
-            - exact file
-            - exact line range
-            - concrete code behavior
-
-            Process:
-            1. Review signals
-            2. Select relevant files
-            3. Call read_file
-            4. Analyze actual code
-            5. Report findings
+            - No stylistic nitpicks
+            - Every issue must cite: exact file, exact line range, concrete code behavior
+            - Focus on: bugs, resource leaks, security issues, error handling
+            - Ignore build artifacts (.next, dist, node_modules)
 
             Output format:
 
             ISSUE <id>
-            Type:
-            Severity:
-            File:
-            Lines:
-            Explanation:
-            Why this matters:
-            Suggested fix:
-
+            Type: <bug/security/resource-leak/error-handling>
+            Severity: <high/medium/low>
+            File: <path>
+            Lines: <start-end>
+            Explanation: <what's wrong>
+            Why this matters: <impact>
+            Suggested fix: <how to fix>
             """
         )
     
@@ -189,112 +239,137 @@ def build_prompt(args) -> str:
             You are executing the CLI command: optimize.
 
             Goal:
-            Identify performance, memory, scalability, or efficiency improvements.
+            Identify performance, scalability, or architectural optimization opportunities.
+            Target directory: '{args.path}' (if '.' then analyze entire codebase)
 
             How to work:
-            - Signals indicate possible hotspots only
-            - You MUST read the relevant files using read_file before suggesting changes
-            - Do NOT infer behavior from method names alone
-            - Base conclusions on actual code paths and execution context
-
-            Optimization scope:
-            - Repeated expensive operations
-            - Avoidable recomputation
-            - Inefficient data flow
-            - Resource misuse (IO, memory, CPU, GPU)
-            - Poor lifecycle management (models, files, connections)
+            1. Make MULTIPLE search_relevant_code calls (at least 5-6 searches):
+               - search_relevant_code("nested loops iterations performance bottlenecks", max_results=20)
+               - search_relevant_code("expensive operations training model computations", max_results=20)
+               - search_relevant_code("repeated calculations redundant API calls", max_results=20)
+               - search_relevant_code("large data processing memory usage", max_results=20)
+               - search_relevant_code("database queries N+1 problems", max_results=20)
+               - search_relevant_code("caching memoization optimization opportunities", max_results=20)
+            
+            2. Examine results with similarity > 0.3
+            
+            3. Read relevant files using read_file
+            
+            4. Analyze for optimization opportunities
+            
+            5. Provide 5-8 specific recommendations with code examples
 
             Rules:
             - Plain text only
-            - No hypothetical optimizations
-            - No framework-specific assumptions unless visible in code
-            - If no real optimization exists, say so clearly
+            - No markdown
+            - Base every suggestion on concrete evidence
+            - Focus on: algorithmic improvements, caching, redundant work, resource usage
+            - Ignore micro-optimizations and build artifacts
 
             Output format:
 
-            SUGGESTION <id>
-            Category:
-            Impact:
-            File:
-            Lines:
-            Observed behavior:
-            Why it is inefficient:
-            Concrete improvement:
-
+            SUGGESTION <number>
+            Category: <Performance/Memory/I/O/Design>
+            Impact: <Low/Medium/High>
+            File(s): <paths>
+            Evidence: <what you found>
+            Current Code:
+            <code snippet>
+            
+            Optimized Code:
+            <improved code>
+            
+            Expected Improvement: <description>
             """
         )
     
     if args.command == "fix":
-        if args.allow_refactor:
-            return (
-                f"""
-                You are executing the CLI command: fix (REFRACTOR MODE ENABLED).
+        refactor_mode = "(REFACTOR MODE ENABLED)" if args.allow_refactor else ""
+        refactor_note = "- Refactoring is allowed if it improves correctness, clarity, or robustness\n" if args.allow_refactor else ""
+        
+        return (
+            f"""
+            You are executing the CLI command: fix {refactor_mode}.
 
-                Goal:
-                Generate concrete, copy-pasteable code fixes and refactors.
+            Goal:
+            Generate concrete, copy-pasteable code fixes for issues.
+            Target directory: '{args.path}' (if '.' then analyze entire codebase)
 
-                Rules:
-                - Output ONLY code changes
-                - No explanations, no markdown, no commentary
-                - Each fix must include exact code blocks
-                - Code must be directly usable by the developer
-                - Refactoring is allowed if it improves correctness, clarity, or robustness
-                - If behavior changes, ensure backward compatibility
-                - You MUST call read_file on relevant files before proposing any fix
-                - If you have not read at least one file, you MUST NOT produce an answer
-                - If genuinely there are no improvements, respond with: NO_FIXES_FOUND
-                - Do NOT invent files or symbols
+            How to work:
+            1. Make MULTIPLE search_relevant_code calls (at least 4-5 searches):
+               - search_relevant_code("bugs errors exceptions failures crashes", max_results=20)
+               - search_relevant_code("security vulnerabilities XSS injection CSRF", max_results=20)
+               - search_relevant_code("race conditions deadlocks concurrency issues", max_results=20)
+               - search_relevant_code("memory leaks resource cleanup disposal", max_results=20)
+               - search_relevant_code("null pointer undefined reference errors", max_results=20)
+            
+            2. Examine results with similarity > 0.3
+            
+            3. Read relevant files using read_file for full context
+            
+            4. Generate exact, copy-pasteable fixes
+            
+            5. Provide 3-5 fixes with before/after code
 
-                Output format:
+            Rules:
+            - Output ONLY code changes
+            - No explanations, no markdown, no commentary
+            - Each fix must include exact code blocks
+            - Code must be directly usable
+            - MUST read files before proposing fixes
+            - If no fixes possible: NO_FIXES_FOUND
+            - Ignore build artifacts
+            {refactor_note}
+            Output format:
 
-                FIX <id>
-                FILE: <relative/path>
-                REPLACE:
-                <exact code to replace>
+            FIX <id>
+            FILE: <relative/path>
+            REPLACE:
+            <exact code to replace>
 
-                WITH:
-                <exact replacement code>
+            WITH:
+            <exact replacement code>
 
-                Repeat for each fix."""
-            )
-        else:
-            return (
-                f"""
-                You are executing the CLI command: fix.
+            Repeat for each fix.
+            """
+        )
+    
+    if args.command == "git-summary":
+        return (
+            """
+            You are executing the CLI command: git-summary.
 
-                Goal:
-                Generate concrete, copy-pasteable code fixes for real correctness issues.
+            Goal:
+            Provide a concise overview of the current Git state of the project.
 
-                Rules:
-                - Output ONLY code changes
-                - No explanations, no markdown, no commentary
-                - Each fix must include exact code blocks
-                - Code must be directly usable by the developer
-                - If a fix spans multiple files, include separate code blocks
-                - Do NOT invent files or symbols
-                - Use read_file to get full context before proposing changes
-                - If no safe fix exists, output: NO_FIXES_FOUND
+            Rules:
+            - Plain text only
+            - No markdown
+            - Do not explain Git concepts
+            - Do not suggest actions
 
-                Output format:
+            Output format:
 
-                FIX <id>
-                FILE: <relative/path>
-                REPLACE:
-                <exact code to replace>
+            REPOSITORY
+            - Git repo: <yes/no>
+            - Branch: <branch-name>
+            - Working tree: <clean/dirty>
 
-                WITH:
-                <exact replacement code>
+            RECENT COMMITS
+            - <hash> | <date> | <message>
+            - <hash> | <date> | <message>
 
-                Repeat for each fix.
-                """
-            )
+            SUMMARY
+            Explain recent commits in a few sentences
+            """
+        )
 
     raise ValueError("Unknown command")
 
 async def main():
     parser = argparse.ArgumentParser(
         prog="dev-assistant",
-        description="Codebase Understanding Assistant"
+        description="Codebase Understanding Assistant (RAG-powered)"
     )
 
     subparser = parser.add_subparsers(dest="command", required=True)
@@ -324,6 +399,8 @@ async def main():
     fix.add_argument("path", nargs="?", default=".", help="Optional subdirectory to fix")
     fix.add_argument("--allow-refactor", action="store_true", help="Allow refactoring and structural code changes")
 
+    subparser.add_parser("git-summary", help="Get summary of github activity")
+
     args = parser.parse_args()
     prompt = build_prompt(args)
 
@@ -331,34 +408,21 @@ async def main():
         parser.print_help()
         sys.exit(1)
     
-    client = MCPClient(
-        command="uv",
-        args=["run", "mcp_server/server.py"]
-    )
+    client = MCPHTTPClient()
 
     try:
-        signals = None
-        obj = None
-        if args.command == "lint":
-            path_arg = args.path if args.path else "."
-            signals = await client.call_tool("lint", {"path": path_arg})
+        git_ctx = get_git_context()
+        git_info = None
         
-        elif args.command == "optimize":
-            path_arg = args.path if args.path else "."
-            signals = await client.call_tool("optimize", {"path": path_arg})
+        if git_ctx == "LOCAL_GIT":
+            res = await client.read_resource("dev-assistant://commits")
+            git_info = json.loads(res)
 
-        elif args.command == "fix":
-            path_arg = args.path if args.path else "."
-            signals = await client.call_tool("fix", {"path": path_arg})
-
-        # print(f"DEBUG: Type: {type(signals)}")
-        # print(f"DEBUG: Signals: {signals}")
-        if signals is not None:
-            res = json.loads(signals)
-            obj = json.dumps(res)
-        # print(obj)
-        response = await client.ask(prompt, args.command, obj)
+        print(f"[INFO] Executing {args.command} command...")
+        
+        response = await client.ask(prompt, args.command, git_info)
         print(response)
+
     finally:
         await client.close()
 
