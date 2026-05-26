@@ -274,10 +274,11 @@ class CodeEmbedder:
                 "points": []
             }
 
-embedder = None
+_embedders: dict = {}
 
-def get_embedder():
-    global embedder
-    if embedder is None:
-        embedder = CodeEmbedder(WORKSPACE_ROOT)
-    return embedder
+def get_embedder(workspace=None):
+    global _embedders
+    target = Path(workspace).resolve() if workspace else WORKSPACE_ROOT
+    if target not in _embedders:
+        _embedders[target] = CodeEmbedder(target)
+    return _embedders[target]

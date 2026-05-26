@@ -104,19 +104,26 @@ def set_git_context_for_workspace(workspace: str, has_git: bool, is_local: bool)
 @app.post("/workspace/set")
 async def set_workspace(request: WorkspaceRequest):
     global CURRENT_WORKSPACE
-    
+
     workspace_path = Path(request.workspace).resolve()
-    
+
     if not workspace_path.exists():
         raise HTTPException(status_code=404, detail="Workspace path does not exist")
-    
+
     if not workspace_path.is_dir():
         raise HTTPException(status_code=400, detail="Workspace must be a directory")
-    
+
     CURRENT_WORKSPACE = str(workspace_path)
-    
+
+    # Propagate the new workspace to the MCP server process
+    try:
+        client = await get_mcp_client()
+        await client.call_tool("set_workspace", {"path": CURRENT_WORKSPACE})
+    except Exception as e:
+        print(f"Warning: could not update MCP server workspace: {e}")
+
     git_ctx = get_git_context_for_workspace(CURRENT_WORKSPACE)
-    
+
     return {
         "status": "success",
         "workspace": CURRENT_WORKSPACE,
@@ -155,7 +162,7 @@ async def build_index(workspace: str = Depends(get_current_workspace)):
         workspace_path = Path(workspace)
         os.chdir(workspace_path)
 
-        embedder = get_embedder()
+        embedder = get_embedder(workspace)
         embedder.index_workspace()
         stats = embedder.get_stats()
         return {
@@ -171,7 +178,7 @@ async def build_index(workspace: str = Depends(get_current_workspace)):
 @app.get("/index/stats")
 async def get_index_stats():
     try:
-        embedder = get_embedder()
+        embedder = get_embedder(CURRENT_WORKSPACE)
         stats = embedder.get_stats()
         
         return {
@@ -184,7 +191,7 @@ async def get_index_stats():
 @app.post("/index/clear")
 async def clear_index():
     try:
-        embedder = get_embedder()
+        embedder = get_embedder(CURRENT_WORKSPACE)
         embedder.clear_index()
         
         return {
@@ -293,8 +300,8 @@ async def visualize_index(
     workspace: str = Depends(get_current_workspace)
 ):
     try:
-        embedder = get_embedder()
-        
+        embedder = get_embedder(workspace)
+
         print(f"Generating visualization for {max_points} points...")
         viz_data = embedder.visualize_vector_space(max_points=max_points)
         
