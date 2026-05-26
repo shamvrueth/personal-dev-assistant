@@ -8,9 +8,25 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
 
+# Environment & secrets
 .env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
 
 # MCP / tooling
 .mcp/
 .mcp_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
