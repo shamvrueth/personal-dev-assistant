@@ -6,27 +6,54 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List
 import re
-import asyncio
+import sys
 from mcp.server.fastmcp.prompts import base
 from system_prompt import SYSTEM_PROMPT
 from openai import OpenAI
 import json
 import inspect
-from raw_signal import collect_signals
+# from raw_signal import collect_signals
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from embedder import get_embedder
+import subprocess
 
 load_dotenv()
 mcp = FastMCP("PersonalDevAssistant", log_level="ERROR")
 openai = OpenAI()
 
-WORKSPACE_ROOT = os.getenv("MCP_WORKSPACE")
+_ws = os.getenv("MCP_WORKSPACE")
+WORKSPACE_ROOT: Path | None = Path(_ws).resolve() if _ws else None
 
-assert WORKSPACE_ROOT, "Error: MCP_WORKSPACE cannot be empty. Update .env"
-WORKSPACE_ROOT = Path(WORKSPACE_ROOT).resolve()
+def _ws_root() -> Path:
+    if WORKSPACE_ROOT is None:
+        raise ValueError("Workspace not set. Use /workspace/set in the app first.")
+    return WORKSPACE_ROOT
+
+
+@mcp.tool(
+    name="set_workspace",
+    description="Update the workspace root used by all tools"
+)
+async def set_workspace_tool(
+    path: str = Field(description="Absolute path to the new workspace directory"),
+    ctx: Context = None
+) -> str:
+    global WORKSPACE_ROOT
+    new_path = Path(path).resolve()
+    if not new_path.exists():
+        raise ValueError(f"Path does not exist: {path}")
+    if not new_path.is_dir():
+        raise ValueError(f"Path is not a directory: {path}")
+    WORKSPACE_ROOT = new_path
+    if ctx:
+        await ctx.info(f"Workspace updated to: {WORKSPACE_ROOT}")
+    return str(WORKSPACE_ROOT)
+
 
 BINARY_EXTENSIONS = {
     ".pdf", ".png", ".jpg", ".jpeg", ".gif",
     ".zip", ".tar", ".gz", ".exe", ".dll",
-    ".docx", ".pptx", ".xlsx"
+    ".docx", ".pptx", ".xlsx", ".svg"
 }
 
 EXCLUDED_DIRS = {
@@ -42,14 +69,20 @@ MAX_FILES_SCANNED = 300
 MAX_LINES_READ = 100
 
 ENTRY_PATTERNS = {
-    "python": "__name__ == \"__main__\"",
-    "c": "int main(",
-    "cpp": "int main(",
-    "java": "static void main(",
+    "python_main": "if __name__ == \"__main__\"",
+    "python_main_alt": "if __name__ == '__main__'",
+    "c_cpp": "int main(",
+    "java": "public static void main(",
     "go": "func main()",
     "rust": "fn main()",
     "csharp": "static void Main(",
-    "javascript": "require.main === module",
+    "javascript_module": "require.main === module",
+    "express": "app.listen(",
+    "fastapi": "uvicorn.run(",
+    "flask": "app.run(",
+    "django": "execute_from_command_line(",
+    "react": "ReactDOM.render(",
+    "nextjs": "export default function",
 }
 
 ALLOWED_EXTENSIONS = {
@@ -60,19 +93,26 @@ ALLOWED_EXTENSIONS = {
     ".ex", ".exs", ".erl", ".hs"
 }
 
-COMMON_ENTRY_NAMES = {"main", "index", "app", "server"}
-
-COMMAND_TOOL_ALLOWLIST = {
-    "explain-flow": {"read_file", "find_entry_points"},
-    "explain": {"summarize_project", "read_file", "find_entry_points"},
-    "find": {"search_code"},
-    "lint": {"read_file"},
-    "optimize": {"read_file"},
-    "explain-file": {"read_file", "search_code"},
-    "tree": {"list_directory"},
-    "fix": {"read_file"}
+COMMON_ENTRY_NAMES = {
+    "main", "index", "app", "server", "start",
+    "__main__", "run", "cli", "manage",
+    "entry", "bootstrap",
+    "wsgi", "asgi",
 }
 
+COMMAND_TOOL_ALLOWLIST = {
+    "explain-flow": {"read_file", "find_entry_points", "search_relevant_code"},
+    "entry": {"find_entry_points", "read_file"},
+    "explain": {"summarize_project", "read_file", "find_entry_points", "search_relevant_code"},
+    "find": {"search_code", "search_relevant_code"},
+    "lint": {"read_file", "search_relevant_code"},
+    "optimize": {"read_file", "search_relevant_code"},
+    "explain-file": {"read_file", "search_code", "search_relevant_code"},
+    "tree": {"list_directory"},
+    "fix": {"read_file", "search_relevant_code"}
+}
+
+# _SIGNAL_CACHE = None
 
 @mcp.tool(
     name="read_file",
@@ -83,10 +123,11 @@ async def read_file(
     ctx: Context = None
 ) -> str:
     
-    file_path = (WORKSPACE_ROOT / path).resolve()
+    ws = _ws_root()
+    file_path = (ws / path).resolve()
     await ctx.info(f"Reading file: {path}")
 
-    if not str(file_path).startswith(str(WORKSPACE_ROOT)):
+    if not str(file_path).startswith(str(ws)):
         raise ValueError("Access Denied: Path outside workspace")
     
     if not file_path.exists():
@@ -118,22 +159,23 @@ async def list_directory(
     ctx: Context = None
 ) -> List[Dict]:
     
-    dir = (WORKSPACE_ROOT / path).resolve()
+    ws = _ws_root()
+    dir = (ws / path).resolve()
     await ctx.info(f"Listing directory: {dir}")
 
-    if not str(dir).startswith(str(WORKSPACE_ROOT)):
+    if not str(dir).startswith(str(ws)):
         raise ValueError("Access Denied: Path outside workspace")
 
     if not dir.exists():
         raise ValueError(f"Directory not found: {path}")
-    
+
     if not dir.is_dir():
         raise ValueError(f"Not a directory: {path}")
 
     res = []
     for entry in dir.iterdir():
         try:
-            relative_path = entry.relative_to(WORKSPACE_ROOT)
+            relative_path = entry.relative_to(ws)
             res.append({
                     "name": entry.name,
                     "path": str(relative_path),
@@ -149,34 +191,28 @@ async def list_directory(
 
 @mcp.tool(
     name="search_code",
-    description="Search for a text pattern across all the files in the workspace"
+    description="Search for exact text pattern across all files (case-insensitive)"
 )
 async def search_code(
     query: str = Field(description="Text to search for"),
-    path: str = Field(
-        default=".",
-        description="Relative directory to search in (default: workspace root)"
-    ),
+    path: str = Field(default=".", description="Directory to search in"),
     max_results: int = 50,
     raw: bool = False,
     ctx: Context = None
 ) -> List[Dict]:
     
-    # await ctx.info(f"Searching project for '{query}'")
-
-    # normalize query to get meaningful tokens (to support multiline queries)
-    re.sub(r'\(.*\)', '', query) # in functions remove '()' funcname() -> func
-    tokens = set(
-        t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query)
-        if len(t) >= 1
-    )
-
-    if not tokens:
-        raise ValueError("Query does not contain searchable tokens")
+    query_lower = query.lower()
+    
+    if not query or len(query.strip()) == 0:
+        return []
+    
+    if not re.search(r'[A-Za-z0-9_]', query):
+        return []
     
     fs = 0
-    search_path = (WORKSPACE_ROOT / path).resolve()
-    if not str(search_path).startswith(str(WORKSPACE_ROOT)):
+    ws = _ws_root()
+    search_path = (ws / path).resolve()
+    if not str(search_path).startswith(str(ws)):
         raise ValueError("Access Denied: Path outside workspace")
     
     if not search_path.exists():
@@ -188,16 +224,18 @@ async def search_code(
             break
 
         normalized = str(fp).replace("\\", "/")
+        
+        # Skip excluded directories including .next
         if any(seg in normalized for seg in EXCLUDED_DIRS):
             continue
 
         if len(res) >= max_results:
             break
 
-        if not fp.is_file(): # skip non files
+        if not fp.is_file():
             continue
 
-        if fp.suffix.lower() in BINARY_EXTENSIONS: # skip files which cannot be read normally
+        if fp.suffix.lower() in BINARY_EXTENSIONS:
             continue
 
         if fp.suffix.lower() not in ALLOWED_EXTENSIONS:
@@ -210,28 +248,29 @@ async def search_code(
             continue
         
         fs += 1
-        # if (fs % 100 == 0):
-            # await ctx.info(f"Scanned {fs} files…")
+        
         try:
             with fp.open("r", encoding="utf-8", errors="ignore") as f:
                 for n, line in enumerate(f, start=1):
-                    if line.strip().startswith("#"): # to not scan commented lines
+                    line_lower = line.lower()
+                    
+                    # Skip comments
+                    if line.strip().startswith("#"):
                         continue
-                    if any(token in line for token in tokens):
+                    
+                    # Case-insensitive matching
+                    if query_lower in line_lower:
                         res.append({
-                            "file": str(fp.relative_to(WORKSPACE_ROOT)),
+                            "file": str(fp.relative_to(ws)),
                             "line": n,
                             "snippet": line.strip(),
-                            "matched_tokens": [t for t in tokens if t in line]
                         })
                         if len(res) >= max_results:
                             break
         except Exception:
             continue
     
-    # await ctx.info(f"Search complete. Found {len(res)} matches.")
     return res
-
 
 @mcp.tool(
     name="project_tree",
@@ -263,30 +302,59 @@ async def project_tree(
 
         return tree
     
-    return walk(WORKSPACE_ROOT, 1)
+    return walk(_ws_root(), 1)
 
 
 
 @mcp.tool(
     name="find_entry_points",
-    description="Identify likely execution entry points"
+    description="Identify likely execution entry points in the project"
 )
 async def find_entry_points(ctx: Context) -> List[Dict]:
 
     await ctx.info("Scanning project for entry points")
     entry_points = []
+    seen_files = set()
     fs = 0
 
-    for path in WORKSPACE_ROOT.rglob("*"):
-        parts = set(path.parts)
+    ws = _ws_root()
 
+    # Check package.json first
+    package_json = ws / "package.json"
+    if package_json.exists():
+        try:
+            with open(package_json, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+                if "main" in data:
+                    entry_points.append({
+                        "file": data["main"],
+                        "reason": f"package.json 'main' field",
+                        "type": "package_main"
+                    })
+
+                if "scripts" in data:
+                    for script_name, script_cmd in data["scripts"].items():
+                        if script_name in ["start", "dev", "serve", "main"]:
+                            entry_points.append({
+                                "file": "package.json",
+                                "reason": f"npm script '{script_name}': {script_cmd}",
+                                "type": "npm_script"
+                            })
+        except Exception:
+            pass
+
+    # Scan files
+    for path in ws.rglob("*"):
         if fs >= MAX_FILES_SCANNED:
             break
-        
-        if "site-packages" in parts:
-            continue
 
+        # Skip excluded directories (including .next)
         if any(part in EXCLUDED_DIRS for part in path.parts):
+            continue
+        
+        normalized = str(path).replace("\\", "/")
+        if any(seg in normalized for seg in EXCLUDED_DIRS):
             continue
 
         if not path.is_file():
@@ -295,32 +363,46 @@ async def find_entry_points(ctx: Context) -> List[Dict]:
         if path.suffix.lower() in BINARY_EXTENSIONS:
             continue
         
+        if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+
         fs += 1
-        rel_path = str(path.relative_to(WORKSPACE_ROOT))
+        rel_path = str(path.relative_to(ws))
+        
+        if rel_path in seen_files:
+            continue
+
         stem = path.stem.lower()
 
+        # Check for common entry filenames
         if stem in COMMON_ENTRY_NAMES:
             entry_points.append({
                 "file": rel_path,
-                "reason": "Common entry filename"
+                "reason": f"Common entry filename: '{stem}{path.suffix}'",
+                "type": "common_name"
             })
-    
+            seen_files.add(rel_path)
+            continue
+
+        # Check file content for entry patterns
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
-                head = "".join(
-                    f.readline() for _ in range(MAX_LINES_READ)
-                )
+                head = "".join([f.readline() for _ in range(50)])
 
             for lang, pattern in ENTRY_PATTERNS.items():
                 if pattern in head:
                     entry_points.append({
                         "file": rel_path,
-                        "reason": f"Contains {lang} entry point pattern"
+                        "reason": f"Contains {lang} entry pattern: '{pattern}'",
+                        "type": "code_pattern"
                     })
+                    seen_files.add(rel_path)
+                    break
+
         except Exception:
             continue
 
-        if len(entry_points) >= 10:
+        if len(entry_points) >= 15:
             break
     
     await ctx.info(f"Detected {len(entry_points)} possible entry points")
@@ -335,9 +417,10 @@ async def find_entry_points(ctx: Context) -> List[Dict]:
 async def summarize_project(ctx: Context) -> Dict:
 
     await ctx.info("Collecting top-level structure")
-    project_name = WORKSPACE_ROOT.name
+    ws = _ws_root()
+    project_name = ws.name
     items = []
-    for path in WORKSPACE_ROOT.iterdir():
+    for path in ws.iterdir():
         if path.name.startswith("."):
             continue
         items.append(path.name + ("/" if path.is_dir() else ""))
@@ -347,12 +430,12 @@ async def summarize_project(ctx: Context) -> Dict:
         "README.md", "README.txt", "pyproject.toml", "requirements.txt",
         "package.json", "pom.xml", "build.gradle", "Makefile",
     ):
-        candidate = WORKSPACE_ROOT / name
+        candidate = ws / name
         if candidate.exists():
             key_files.append(name)
-    
+
     extensions = set()
-    for path in WORKSPACE_ROOT.rglob("*"):
+    for path in ws.rglob("*"):
         if path.is_file() and path.suffix:
             extensions.add(path.suffix.lower())
 
@@ -377,19 +460,10 @@ async def summarize_project(ctx: Context) -> Dict:
 async def lint(
     path: str = Field(default="."),
 ):
-    try:
-        async def search_wrapper(query: str, path_override: str = "."):
-            return await search_code(query, path_override)
-        
-        signals = await collect_signals(search_wrapper, path)
-
-        return json.dumps(signals, indent=2)
-    except Exception as e:
-        import traceback
-        return json.dumps({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        })
+    return {
+        "message": "Lint analysis requested",
+        "path": path
+    }
 
 
 @mcp.tool(
@@ -399,18 +473,10 @@ async def lint(
 async def optimize(
     path: str = Field(default="."),
 ):
-    async def search_wrapper(query: str, path_override: str = "."):
-        return await search_code(query=query, path=path_override)
-    
-    signals = await collect_signals(search_wrapper, path)
-
-    optimize_signals = {
-        "expensive_ops": signals.get("expensive_ops", []),
-        "external_calls": signals.get("external_calls", []),
-        "definitions": signals.get("definitions", {}),
-        "usages": signals.get("usages", {}),
+    return {
+        "message": "Optimize analysis requested",
+        "path": path
     }
-    return optimize_signals
 
 
 @mcp.tool(
@@ -420,15 +486,9 @@ async def optimize(
 async def fix(
     path: str = Field(default="."),
 ):
-    async def search_wrapper(query: str, path_override: str = "."):
-        return await search_code(query=query, path=path_override)
-
-    signals = await collect_signals(search_wrapper, path)
-
     return {
-        "unused": signals.get("unused", []),
-        "external_calls": signals.get("external_calls", []),
-        "try_blocks": signals.get("try_blocks", []),
+        "message": "Fix analysis requested",
+        "path": path
     }
 
 
@@ -439,10 +499,11 @@ async def fix(
 async def query(
     question: str = Field(description="User's question about the project"),
     command: str = Field(description="The requested command"),
-    signals: dict | None = Field(
-        default=None,
-        description="Optional precomputed analysis signals (used by lint)"
-    ),
+    # signals: dict | None = Field(
+    #     default=None,
+    #     description="Optional precomputed analysis signals (used by lint)"
+    # ),
+    git_info: dict | None = None, 
     ctx: Context = None
 ) -> str:
     await ctx.info("Starting agentic query...")
@@ -468,15 +529,27 @@ async def query(
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-
-    if signals is not None:
+    
+    # Add command-specific guidance
+    if command in ["lint", "optimize", "fix"]:
         messages.append({
             "role": "system",
             "content": (
-                "Precomputed analysis signals are provided below. "
-                "You MUST base your reasoning only on these signals. "
-                "Do NOT attempt to rescan the codebase.\n\n"
-                f"{json.dumps(signals, indent=2)}"
+                f"You are performing a '{command}' analysis.\n\n"
+                "Use search_relevant_code tool to find relevant code chunks.\n"
+                "Make 3-5 targeted searches to comprehensively analyze the codebase.\n\n"
+                f"Recommended search queries for {command}:\n" +
+                get_recommended_searches(command)
+            )
+        })
+    
+    if git_info:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Additional Git context is provided below. "
+                "Use it only if relevant.\n\n"
+                f"{json.dumps(git_info, indent=2)}"
             )
         })
 
@@ -522,10 +595,134 @@ async def query(
                 "tool_call_id": call.id,
                 "content": str(result),
             })
+    
     await ctx.info("Agent stopped due to step limit")
     return "I could not fully answer the question within the allowed reasoning steps."
 
+def get_recommended_searches(command: str) -> str:
+    recommendations = {
+        "lint": """
+        1. search_relevant_code("error handling try catch exception blocks")
+        2. search_relevant_code("database connections queries SQL transactions")
+        3. search_relevant_code("file operations open read write close cleanup")
+        4. search_relevant_code("resource management memory leaks connections")
+        5. search_relevant_code("async await promises concurrent threading")
+        6. search_relevant_code("security vulnerabilities injection validation")
+        """,
+        "optimize": """
+        1. search_relevant_code("nested loops iterations performance bottlenecks")
+        2. search_relevant_code("expensive operations training model computations")
+        3. search_relevant_code("repeated calculations redundant API calls")
+        4. search_relevant_code("large data processing memory usage")
+        5. search_relevant_code("database queries N+1 problems")
+        6. search_relevant_code("caching memoization optimization opportunities")
+        """,
+        "fix": """
+        1. search_relevant_code("bugs errors exceptions failures crashes")
+        2. search_relevant_code("security vulnerabilities XSS injection CSRF")
+        3. search_relevant_code("race conditions deadlocks concurrency issues")
+        4. search_relevant_code("memory leaks resource cleanup disposal")
+        5. search_relevant_code("null pointer undefined reference errors")
+        6. search_relevant_code("type errors validation inconsistencies")
+        """
+    }
+    return recommendations.get(command, "Use search_relevant_code to find relevant code.")
 
+# @mcp.resource(
+#     uri="dev-assistant://signals",
+#     description="Cached high-level directory structure of the workspace"
+# )
+# async def analysis_signals() -> dict:
+#     global _SIGNAL_CACHE
+#     if _SIGNAL_CACHE is not None:
+#         return _SIGNAL_CACHE
+    
+#     async def search_wrapper(query: str, path_override: str = "."):
+#         return await search_code(
+#             query=query,
+#             path=path_override,
+#         )
+    
+#     signals = await collect_signals(search_fn=search_wrapper, base_path=".")
+#     _SIGNAL_CACHE = signals
+#     return json.dumps(signals)
+
+@mcp.tool(
+    name="search_relevant_code",
+    description="Find code chunks semantically relevant to a natural language query. Use this for lint, optimize, and fix commands instead of scanning entire codebase."
+)
+async def search_relevant_code(
+    query: str = Field(description="Natural language description of code to find"),
+    max_results: int = Field(default=15, description="Maximum results to return"),
+    ctx: Context = None
+):
+    await ctx.info(f"Searching for: {query}")
+    
+    try:
+        embedder = get_embedder(WORKSPACE_ROOT)
+        results = embedder.search_relevant_code(query, n_results=max_results)
+
+        # print(f"FOUND: {len(results)} chunks")  # debug
+        # if results:
+        #     print(f"   Top 3: {[r['file'] for r in results[:3]]}")
+
+        # await ctx.info(f"Found {len(results)} relevant code chunks")
+        return results
+    
+    except Exception as e:
+        await ctx.info(f"Search failed: {e}")
+        return []
+
+@mcp.resource("dev-assistant://commits")
+async def recent_commits():
+    print("recent_commits: started")
+    try:
+        limit = 5
+        # run all git commands from the configured workspace root to ensure
+        # we query the correct repository (not the process cwd)
+        cwd = str(_ws_root())
+
+        # get current branch
+        branch = subprocess.check_output([
+            "git", "rev-parse", "--abbrev-ref", "HEAD"
+        ], text=True, cwd=cwd).strip()
+
+        # get commit hashes
+        commit_hashes = subprocess.check_output(
+            ["git", "log", f"-{limit}", "--pretty=%H"], text=True, cwd=cwd
+        ).splitlines()
+
+        commits = []
+
+        for h in commit_hashes:
+            meta = subprocess.check_output(
+                ["git", "show", "-s", "--format=%an|%ad|%s", h], text=True, cwd=cwd
+            ).strip()
+
+            author, date, message = meta.split("|", 2)
+
+            files = subprocess.check_output(
+                ["git", "show", "--name-only", "--pretty=format:", h], text=True, cwd=cwd
+            ).splitlines()
+
+            commits.append({
+                "hash": h[:7],
+                "author": author,
+                "date": date,
+                "message": message,
+                "files": [f for f in files if f]
+            })
+
+        return json.dumps({
+            "branch": branch,
+            "commits": commits
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "error": "Not a git repository or git unavailable",
+            "details": str(e)
+        })
 
 @mcp.prompt(
     name="assistant",
@@ -542,6 +739,23 @@ def assistant_prompt(query: str) -> list[base.Message]:
     ]
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    import sys
+    
+    if "--http" in sys.argv:
+        import uvicorn
+        
+        port = 3000
+        for i, arg in enumerate(sys.argv):
+            if arg == "--port" and i + 1 < len(sys.argv):
+                port = int(sys.argv[i + 1])
+        
+        uvicorn.run(
+            mcp.streamable_http_app(), 
+            host="127.0.0.1",
+            port=port,
+            log_level="info"
+        )
+    else:
+        mcp.run(transport="stdio")
 
 # {"jsonrpc": "2.0", "method": "tools/call", "params": {"_meta": {"progressToken": "abc123"}, "name": "read_file", "arguments": {"path": "app/main.py"}}, "id": 3}
